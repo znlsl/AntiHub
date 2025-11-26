@@ -23,12 +23,28 @@ export default function DashboardLayout({
     const loginSuccess = searchParams.get('login');
     const token = searchParams.get('token');
     const userParam = searchParams.get('user');
+    const refreshToken = searchParams.get('refresh_token');
+    const expiresIn = searchParams.get('expires_in');
 
     if (loginSuccess === 'success' && token && userParam) {
       try {
         // 立即同步存储到 localStorage
         localStorage.setItem('access_token', token);
         localStorage.setItem('user', decodeURIComponent(userParam));
+        
+        // 保存 refresh_token
+        if (refreshToken) {
+          localStorage.setItem('refresh_token', refreshToken);
+          console.log('Refresh token synced to localStorage');
+        }
+        
+        // 保存 token 过期时间
+        if (expiresIn) {
+          const expiresAt = Date.now() + parseInt(expiresIn, 10) * 1000;
+          localStorage.setItem('token_expires_at', String(expiresAt));
+          console.log('Token expires at:', new Date(expiresAt).toISOString());
+        }
+        
         console.log('Token synced to localStorage');
       } catch (error) {
         console.error('Failed to sync login data:', error);

@@ -1,6 +1,7 @@
 /**
  * API 客户端工具
  * 基于后端 OpenAPI 规范实现
+ * 支持无感刷新 Token
  */
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8008';
@@ -25,8 +26,21 @@ export interface UserResponse {
 
 export interface LoginResponse {
   access_token: string;
+  refresh_token: string;
   token_type: string;
+  expires_in: number;
   user: UserResponse;
+}
+
+export interface RefreshTokenRequest {
+  refresh_token: string;
+}
+
+export interface RefreshTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  expires_in: number;
 }
 
 export interface OAuthInitiateResponse {
@@ -46,6 +60,25 @@ export interface ApiError {
     type: string;
   }>;
 }
+
+// ==================== Token 刷新状态管理 ====================
+
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (token: string | null) => void;
+  reject: (error: Error) => void;
+}> = [];
+
+const processQueue = (error: Error | null, token: string | null = null) => {
+  failedQueue.forEach(prom => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
 
 // ==================== 工具函数 ====================
 
@@ -72,11 +105,149 @@ async function handleResponse<T>(response: Response): Promise<T> {
  * 获取认证 header
  */
 function getAuthHeaders(): HeadersInit {
-  const token = localStorage.getItem('access_token');
+  const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
   return {
     'Content-Type': 'application/json',
     ...(token && { 'Authorization': `Bearer ${token}` })
   };
+}
+
+/**
+ * 保存登录凭证到 localStorage
+ */
+function saveAuthCredentials(data: LoginResponse | RefreshTokenResponse, user?: UserResponse) {
+  if (typeof window === 'undefined') return;
+  
+  localStorage.setItem('access_token', data.access_token);
+  localStorage.setItem('refresh_token', data.refresh_token);
+  localStorage.setItem('token_expires_at', String(Date.now() + data.expires_in * 1000));
+  
+  if (user) {
+    localStorage.setItem('user', JSON.stringify(user));
+  }
+}
+
+/**
+ * 清除所有认证凭证
+ */
+function clearAuthCredentials() {
+  if (typeof window === 'undefined') return;
+  
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+  localStorage.removeItem('token_expires_at');
+  localStorage.removeItem('user');
+}
+
+/**
+ * 刷新 Token
+ */
+async function refreshToken(): Promise<RefreshTokenResponse> {
+  const refreshTokenValue = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
+  
+  if (!refreshTokenValue) {
+    throw new Error('No refresh token available');
+  }
+  
+  const response = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ refresh_token: refreshTokenValue }),
+  });
+  
+  if (!response.ok) {
+    throw new Error('Token refresh failed');
+  }
+  
+  return response.json();
+}
+
+/**
+ * 带自动刷新的 fetch 请求
+ * 当遇到 401 错误时，自动尝试刷新 token 并重试请求
+ */
+export async function fetchWithAuth<T>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+  
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+    ...(token && { 'Authorization': `Bearer ${token}` })
+  };
+  
+  const response = await fetch(url, { ...options, headers });
+  
+  // 如果不是 401 错误，直接处理响应
+  if (response.status !== 401) {
+    return handleResponse<T>(response);
+  }
+  
+  // 处理 401 错误 - 尝试刷新 token
+  const refreshTokenValue = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
+  
+  if (!refreshTokenValue) {
+    // 没有 refresh token，清除凭证并抛出错误
+    clearAuthCredentials();
+    throw new Error('Authentication required');
+  }
+  
+  // 如果正在刷新，将请求加入队列
+  if (isRefreshing) {
+    return new Promise<T>((resolve, reject) => {
+      failedQueue.push({
+        resolve: async (newToken) => {
+          if (newToken) {
+            const retryHeaders: HeadersInit = {
+              ...headers,
+              'Authorization': `Bearer ${newToken}`
+            };
+            try {
+              const retryResponse = await fetch(url, { ...options, headers: retryHeaders });
+              resolve(await handleResponse<T>(retryResponse));
+            } catch (error) {
+              reject(error);
+            }
+          } else {
+            reject(new Error('Token refresh failed'));
+          }
+        },
+        reject
+      });
+    });
+  }
+  
+  isRefreshing = true;
+  
+  try {
+    const refreshData = await refreshToken();
+    
+    // 保存新的 token
+    saveAuthCredentials(refreshData);
+    
+    // 处理队列中的请求
+    processQueue(null, refreshData.access_token);
+    
+    // 重试原请求
+    const retryHeaders: HeadersInit = {
+      ...headers,
+      'Authorization': `Bearer ${refreshData.access_token}`
+    };
+    const retryResponse = await fetch(url, { ...options, headers: retryHeaders });
+    return handleResponse<T>(retryResponse);
+    
+  } catch (refreshError) {
+    processQueue(refreshError as Error, null);
+    // 刷新失败，清除 token
+    clearAuthCredentials();
+    throw new Error('Session expired, please login again');
+  } finally {
+    isRefreshing = false;
+  }
 }
 
 // ==================== 认证相关 API ====================
@@ -133,9 +304,8 @@ export async function login(credentials: LoginRequest): Promise<LoginResponse> {
   
   const data = await handleResponse<LoginResponse>(response);
   
-  // 保存 token 到 localStorage
-  localStorage.setItem('access_token', data.access_token);
-  localStorage.setItem('user', JSON.stringify(data.user));
+  // 保存 token 和 refresh_token 到 localStorage
+  saveAuthCredentials(data, data.user);
   
   return data;
 }
@@ -180,9 +350,8 @@ export async function handleGitHubCallback(code: string, state: string): Promise
   
   const data = await handleResponse<LoginResponse>(response);
   
-  // 保存 token 到 localStorage
-  localStorage.setItem('access_token', data.access_token);
-  localStorage.setItem('user', JSON.stringify(data.user));
+  // 保存 token 和 refresh_token 到 localStorage
+  saveAuthCredentials(data, data.user);
   
   return data;
 }
@@ -200,9 +369,8 @@ export async function handleOAuthCallback(code: string, state: string): Promise<
   
   const data = await handleResponse<LoginResponse>(response);
   
-  // 保存 token 到 localStorage
-  localStorage.setItem('access_token', data.access_token);
-  localStorage.setItem('user', JSON.stringify(data.user));
+  // 保存 token 和 refresh_token 到 localStorage
+  saveAuthCredentials(data, data.user);
   
   return data;
 }
@@ -211,30 +379,30 @@ export async function handleOAuthCallback(code: string, state: string): Promise<
  * 登出
  */
 export async function logout(): Promise<LogoutResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/auth/logout`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-  });
+  const refreshTokenValue = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
   
-  const data = await handleResponse<LogoutResponse>(response);
-  
-  // 清除本地存储
-  localStorage.removeItem('access_token');
-  localStorage.removeItem('user');
-  
-  return data;
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/auth/logout`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ refresh_token: refreshTokenValue }),
+    });
+    
+    const data = await handleResponse<LogoutResponse>(response);
+    return data;
+  } finally {
+    // 无论成功与否，都清除本地存储
+    clearAuthCredentials();
+  }
 }
 
 /**
  * 获取当前用户信息
  */
 export async function getCurrentUser(): Promise<UserResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
+  return fetchWithAuth<UserResponse>(`${API_BASE_URL}/api/auth/me`, {
     method: 'GET',
-    headers: getAuthHeaders(),
   });
-  
-  return handleResponse<UserResponse>(response);
 }
 
 // ==================== 本地存储工具 ====================
@@ -262,6 +430,84 @@ export function getStoredUser(): UserResponse | null {
 export function getStoredToken(): string | null {
   if (typeof window === 'undefined') return null;
   return localStorage.getItem('access_token');
+}
+
+/**
+ * 获取本地存储的 refresh token
+ */
+export function getStoredRefreshToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem('refresh_token');
+}
+
+/**
+ * 获取 token 过期时间
+ */
+export function getTokenExpiresAt(): number | null {
+  if (typeof window === 'undefined') return null;
+  const expiresAt = localStorage.getItem('token_expires_at');
+  return expiresAt ? parseInt(expiresAt, 10) : null;
+}
+
+/**
+ * 检查 token 是否即将过期（默认 5 分钟内）
+ */
+export function isTokenExpiringSoon(thresholdMs: number = 5 * 60 * 1000): boolean {
+  const expiresAt = getTokenExpiresAt();
+  if (!expiresAt) return true;
+  return Date.now() + thresholdMs >= expiresAt;
+}
+
+/**
+ * 设置主动刷新 Token 的定时器
+ * 在 token 即将过期前自动刷新
+ */
+export function setupTokenRefresh(onRefreshFailed?: () => void): () => void {
+  let timeoutId: NodeJS.Timeout | null = null;
+  
+  const scheduleRefresh = () => {
+    const expiresAt = getTokenExpiresAt();
+    if (!expiresAt) return;
+    
+    const expiresIn = expiresAt - Date.now();
+    // 在过期前 5 分钟刷新
+    const refreshIn = expiresIn - 5 * 60 * 1000;
+    
+    if (refreshIn > 0) {
+      timeoutId = setTimeout(async () => {
+        try {
+          const refreshData = await refreshToken();
+          saveAuthCredentials(refreshData);
+          // 递归设置下一次刷新
+          scheduleRefresh();
+        } catch (error) {
+          console.error('Token refresh failed:', error);
+          onRefreshFailed?.();
+        }
+      }, refreshIn);
+    } else if (expiresIn > 0) {
+      // Token 即将过期但还没过期，立即刷新
+      (async () => {
+        try {
+          const refreshData = await refreshToken();
+          saveAuthCredentials(refreshData);
+          scheduleRefresh();
+        } catch (error) {
+          console.error('Token refresh failed:', error);
+          onRefreshFailed?.();
+        }
+      })();
+    }
+  };
+  
+  scheduleRefresh();
+  
+  // 返回清理函数
+  return () => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  };
 }
 
 // ==================== 健康检查 ====================
@@ -295,12 +541,10 @@ export interface Account {
  * 获取账号列表
  */
 export async function getAccounts(): Promise<Account[]> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/accounts`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: Account[] }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: Account[] }>(
+    `${API_BASE_URL}/api/plugin-api/accounts`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -308,12 +552,10 @@ export async function getAccounts(): Promise<Account[]> {
  * 获取账号详情
  */
 export async function getAccount(cookieId: string): Promise<Account> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/accounts/${cookieId}`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: Account }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: Account }>(
+    `${API_BASE_URL}/api/plugin-api/accounts/${cookieId}`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -321,12 +563,10 @@ export async function getAccount(cookieId: string): Promise<Account> {
  * 删除账号
  */
 export async function deleteAccount(cookieId: string): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/accounts/${cookieId}`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: any }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: any }>(
+    `${API_BASE_URL}/api/plugin-api/accounts/${cookieId}`,
+    { method: 'DELETE' }
+  );
   return result.data;
 }
 
@@ -334,13 +574,13 @@ export async function deleteAccount(cookieId: string): Promise<any> {
  * 更新账号状态
  */
 export async function updateAccountStatus(cookieId: string, status: number): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/accounts/${cookieId}/status`, {
-    method: 'PUT',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ status }),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: any }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: any }>(
+    `${API_BASE_URL}/api/plugin-api/accounts/${cookieId}/status`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ status }),
+    }
+  );
   return result.data;
 }
 
@@ -348,13 +588,13 @@ export async function updateAccountStatus(cookieId: string, status: number): Pro
  * 获取 OAuth 授权 URL
  */
 export async function getOAuthAuthorizeUrl(isShared: number = 0): Promise<{ auth_url: string; state: string; expires_in: number }> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/oauth/authorize`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ is_shared: isShared }),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: { auth_url: string; state: string; expires_in: number } }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: { auth_url: string; state: string; expires_in: number } }>(
+    `${API_BASE_URL}/api/plugin-api/oauth/authorize`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ is_shared: isShared }),
+    }
+  );
   return result.data;
 }
 
@@ -386,12 +626,10 @@ export interface CreateAPIKeyResponse {
  * 获取 API Key 列表
  */
 export async function getAPIKeys(): Promise<PluginAPIKey[]> {
-  const response = await fetch(`${API_BASE_URL}/api/api-keys`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  return handleResponse<PluginAPIKey[]>(response);
+  return fetchWithAuth<PluginAPIKey[]>(
+    `${API_BASE_URL}/api/api-keys`,
+    { method: 'GET' }
+  );
 }
 
 /**
@@ -399,7 +637,7 @@ export async function getAPIKeys(): Promise<PluginAPIKey[]> {
  */
 export async function getAPIKeyInfo(): Promise<PluginAPIKey | null> {
   const keys = await getAPIKeys();
-  // 返回第一个激活的 API Key，如果没有则返回 null
+  // 返回第一个激活的 API Key，如果没有则返�� null
   return keys.find(key => key.is_active) || keys[0] || null;
 }
 
@@ -407,38 +645,36 @@ export async function getAPIKeyInfo(): Promise<PluginAPIKey | null> {
  * 生成新的 API Key
  */
 export async function generateAPIKey(name: string = 'My API Key'): Promise<CreateAPIKeyResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/api-keys`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ name }),
-  });
-  
-  return handleResponse<CreateAPIKeyResponse>(response);
+  return fetchWithAuth<CreateAPIKeyResponse>(
+    `${API_BASE_URL}/api/api-keys`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }
+  );
 }
 
 /**
  * 删除指定的 API Key
  */
 export async function deleteAPIKey(keyId: number): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/api-keys/${keyId}`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-  
-  return handleResponse<any>(response);
+  return fetchWithAuth<any>(
+    `${API_BASE_URL}/api/api-keys/${keyId}`,
+    { method: 'DELETE' }
+  );
 }
 
 /**
  * 提交 OAuth 回调
  */
 export async function submitOAuthCallback(callbackUrl: string): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/oauth/callback`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ callback_url: callbackUrl }),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: any }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: any }>(
+    `${API_BASE_URL}/api/plugin-api/oauth/callback`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ callback_url: callbackUrl }),
+    }
+  );
   return result.data;
 }
 
@@ -446,12 +682,10 @@ export async function submitOAuthCallback(callbackUrl: string): Promise<any> {
  * 获取账号配额
  */
 export async function getAccountQuotas(cookieId: string): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/accounts/${cookieId}/quotas`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: any }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: any }>(
+    `${API_BASE_URL}/api/plugin-api/accounts/${cookieId}/quotas`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -459,13 +693,13 @@ export async function getAccountQuotas(cookieId: string): Promise<any> {
  * 更新模型配额状态
  */
 export async function updateQuotaStatus(cookieId: string, modelName: string, status: number): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/accounts/${cookieId}/quotas/${modelName}/status`, {
-    method: 'PUT',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ status }),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: any }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: any }>(
+    `${API_BASE_URL}/api/plugin-api/accounts/${cookieId}/quotas/${modelName}/status`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ status }),
+    }
+  );
   return result.data;
 }
 
@@ -473,13 +707,13 @@ export async function updateQuotaStatus(cookieId: string, modelName: string, sta
  * 更新 Cookie 优先级
  */
 export async function updateCookiePreference(preferShared: number): Promise<any> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/preference`, {
-    method: 'PUT',
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ prefer_shared: preferShared }),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: any }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: any }>(
+    `${API_BASE_URL}/api/plugin-api/preference`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ prefer_shared: preferShared }),
+    }
+  );
   return result.data;
 }
 
@@ -487,12 +721,10 @@ export async function updateCookiePreference(preferShared: number): Promise<any>
  * 获取 Cookie 优先级设置
  */
 export async function getCookiePreference(): Promise<{ prefer_shared: number }> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/preference`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: { prefer_shared: number } }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: { prefer_shared: number } }>(
+    `${API_BASE_URL}/api/plugin-api/preference`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -550,12 +782,10 @@ export interface SharedPoolStats {
  * 获取用户配额池
  */
 export async function getUserQuotas(): Promise<UserQuotaItem[]> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/quotas/user`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: UserQuotaItem[] }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: UserQuotaItem[] }>(
+    `${API_BASE_URL}/api/plugin-api/quotas/user`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -574,25 +804,18 @@ export async function getQuotaConsumption(params?: {
   
   const url = `${API_BASE_URL}/api/plugin-api/quotas/consumption${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
   
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: QuotaConsumption[] }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: QuotaConsumption[] }>(url, { method: 'GET' });
   return result.data;
 }
 
 /**
- * 获取共享池配额信息
+ * 获取共享��配额信息
  */
 export async function getSharedPoolQuotas(): Promise<SharedPoolModelQuota[]> {
-  const response = await fetch(`${API_BASE_URL}/api/plugin-api/quotas/shared-pool`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: SharedPoolModelQuota[] }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: SharedPoolModelQuota[] }>(
+    `${API_BASE_URL}/api/plugin-api/quotas/shared-pool`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -600,12 +823,10 @@ export async function getSharedPoolQuotas(): Promise<SharedPoolModelQuota[]> {
  * 获取共享池统计信息
  */
 export async function getSharedPoolStats(): Promise<SharedPoolStats> {
-  const response = await fetch(`${API_BASE_URL}/api/usage/shared-pool/stats`, {
-    method: 'GET',
-    headers: getAuthHeaders(),
-  });
-  
-  const result = await handleResponse<{ success: boolean; data: SharedPoolStats }>(response);
+  const result = await fetchWithAuth<{ success: boolean; data: SharedPoolStats }>(
+    `${API_BASE_URL}/api/usage/shared-pool/stats`,
+    { method: 'GET' }
+  );
   return result.data;
 }
 
@@ -634,6 +855,7 @@ export interface ChatCompletionRequest {
 /**
  * 发送聊天请求（流式）
  * 使用用户的 access_token 进行认证
+ * 支持自动刷新 token
  */
 export async function sendChatCompletionStream(
   request: ChatCompletionRequest,
@@ -641,23 +863,46 @@ export async function sendChatCompletionStream(
   onError: (error: Error) => void,
   onComplete: () => void
 ): Promise<void> {
-  const token = getStoredToken();
+  let token = getStoredToken();
   if (!token) {
     throw new Error('未登录，请先登录');
   }
 
-  try {
-    const response = await fetch(`${API_BASE_URL}/v1/chat/completions`, {
+  const makeRequest = async (authToken: string): Promise<Response> => {
+    return fetch(`${API_BASE_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
+        'Authorization': `Bearer ${authToken}`,
       },
       body: JSON.stringify({
         ...request,
         stream: true,
       }),
     });
+  };
+
+  try {
+    let response = await makeRequest(token);
+
+    // 如果是 401 错误，尝试刷新 token
+    if (response.status === 401) {
+      const refreshTokenValue = getStoredRefreshToken();
+      if (!refreshTokenValue) {
+        clearAuthCredentials();
+        throw new Error('Session expired, please login again');
+      }
+
+      try {
+        const refreshData = await refreshToken();
+        saveAuthCredentials(refreshData);
+        token = refreshData.access_token;
+        response = await makeRequest(token);
+      } catch (refreshError) {
+        clearAuthCredentials();
+        throw new Error('Session expired, please login again');
+      }
+    }
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({

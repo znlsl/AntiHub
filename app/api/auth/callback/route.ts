@@ -4,7 +4,7 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8008';
 const FRONTEND_URL = process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
 
 /**
- * OAuth 回调处理
+ * OAuth 回调处理 (Linux.do SSO)
  * 接收来自 OAuth 提供商的 code 和 state,
  * 转发给后端 API 完成认证,然后重定向到前端
  */
@@ -42,13 +42,21 @@ export async function GET(request: NextRequest) {
     }
 
     const data = await response.json();
-    const { access_token, user } = data;
+    const { access_token, refresh_token, expires_in, user } = data;
 
     // 创建重定向 URL,包含用户信息用于 localStorage 同步
     const redirectUrl = new URL('/dashboard', FRONTEND_URL);
     redirectUrl.searchParams.set('login', 'success');
     redirectUrl.searchParams.set('token', access_token);
     redirectUrl.searchParams.set('user', encodeURIComponent(JSON.stringify(user)));
+    
+    // 添加 refresh_token 和 expires_in 参数
+    if (refresh_token) {
+      redirectUrl.searchParams.set('refresh_token', refresh_token);
+    }
+    if (expires_in) {
+      redirectUrl.searchParams.set('expires_in', String(expires_in));
+    }
 
     const redirectResponse = NextResponse.redirect(redirectUrl);
 
@@ -60,6 +68,16 @@ export async function GET(request: NextRequest) {
       maxAge: 60 * 60 * 24 * 7, // 7 天
       path: '/',
     });
+
+    if (refresh_token) {
+      redirectResponse.cookies.set('refresh_token', refresh_token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 60 * 60 * 24 * 30, // 30 天
+        path: '/',
+      });
+    }
 
     redirectResponse.cookies.set('user', JSON.stringify(user), {
       httpOnly: false, // 允许客户端读取用户信息
