@@ -47,6 +47,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { Tooltip } from '@/components/ui/tooltip-card';
 import { IconCirclePlusFilled, IconDotsVertical, IconRefresh, IconTrash, IconToggleLeft, IconToggleRight, IconExternalLink, IconChartBar, IconChevronDown, IconEdit, IconAlertTriangle } from '@tabler/icons-react';
 import {
   Select,
@@ -586,6 +587,21 @@ export default function AccountsPage() {
                             </TableCell>
                             <TableCell>
                               <div className="flex items-center gap-2">
+                                {account.status === 0 && !account.project_id_0 && !account.paid_tier && (
+                                  <Tooltip
+                                    containerClassName="pointer-events-auto"
+                                    content={
+                                      <div className="space-y-1">
+                                        <p className="font-medium">你的账号暂时无权使用Antigravity。</p>
+                                        <div className="text-xs space-y-0.5">
+                                          我们暂时禁用了你的Antigravity账号。这可能是因为{account.is_restricted && <p> • 你的账号处于受限制的国家或地区。</p>}{account.ineligible && <p> • 你的账号没有Google AI使用资格。</p>}如果你恢复了Antigravity的访问权限，你可手动启用该账号。
+                                        </div>
+                                      </div>
+                                    }
+                                  >
+                                    <IconAlertTriangle className="size-4 text-amber-500 shrink-0 cursor-help" />
+                                  </Tooltip>
+                                )}
                                 <span>{account.name || '未命名'}</span>
                                 {account.need_refresh && (
                                   <Badge variant="outline" className="text-yellow-600 border-yellow-600 bg-yellow-50 dark:bg-yellow-900/20">

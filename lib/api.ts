@@ -634,6 +634,10 @@ export interface Account {
   status: number; // 0=禁用, 1=启用
   is_shared: number; // 0=专属, 1=共享
   need_refresh?: boolean; // 是否需要重新登录
+  project_id_0?: string; // 项目ID
+  is_restricted?: boolean; // 是否被限制
+  paid_tier?: boolean; // 是否付费用户
+  ineligible?: boolean; // 是否不符合条件
   created_at: string;
   updated_at: string;
   last_used_at?: string | null;

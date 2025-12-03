@@ -77,12 +77,12 @@ export default function Home() {
       {/* Logo Loop Section */}
       <section className="relative bg-black py-16">
         <div className="mx-auto max-w-7xl px-4 md:px-6 lg:px-8">
-          <p className="text-center text-md text-white mb-8 font-semibold">被合作伙伴深深信任</p>
+          <p className="text-center text-md text-white mb-8 font-semibold">深受合作伙伴信任</p>
           <div className="h-24 relative overflow-hidden">
             <LogoLoop
               logos={[
                 {
-                  node: <Gemini.Color className="size-12" />,
+                  node: <Gemini className="size-12" />,
                   title: 'Google Gemini',
                   href: 'https://gemini.google.com'
                 },
@@ -122,7 +122,7 @@ export default function Home() {
                   href: 'https://mistral.ai'
                 },
                 {
-                  node: <Gemini.Color className="size-12" />,
+                  node: <Gemini className="size-12" />,
                   title: 'Google Gemini',
                   href: 'https://gemini.google.com'
                 },
